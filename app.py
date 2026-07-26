@@ -17,16 +17,8 @@ MEDIA_BATCH = "application/vnd.ga5.invoice-claim-batch+json"
 PROTO_VERSION = "1.0"
 
 # In-Memory Storage
-# TASKS: taskId -> task_dict
 TASKS: Dict[str, Dict[str, Any]] = {}
-
-# DEDUP_STORE: (principal, message_hash) -> taskId
-DEDUP_STORE: Dict[Tuple[str, str], str] = {}
-
-# MESSAGE_CONTENT_STORE: (principal, messageId) -> (message_hash, taskId)
 MESSAGE_CONTENT_STORE: Dict[Tuple[str, str], Tuple[str, str]] = {}
-
-# PACKAGE_CACHE: package_content_hash -> proposal_dict
 PACKAGE_CACHE: Dict[str, Dict[str, Any]] = {}
 
 
@@ -57,8 +49,7 @@ def get_bearer_principal() -> Optional[str]:
     return token if token else None
 
 
-def validate_a2a_headers() -> Tuple[bool, Optional[Response]]:
-    """Strictly validates A2A-Version and Content-Type headers."""
+def validate_a2a_headers() -> Tuple[bool, Optional[Response], int]:
     version = request.headers.get("A2A-Version")
     if version != PROTO_VERSION:
         return False, jsonify({"error": "Invalid A2A-Version"}), 400
@@ -71,7 +62,7 @@ def validate_a2a_headers() -> Tuple[bool, Optional[Response]]:
     if not principal:
         return False, jsonify({"error": "Unauthorized"}), 401
 
-    return True, None
+    return True, None, 200
 
 
 def make_a2a_response(data: Any, status: int = 200) -> Response:
@@ -88,12 +79,10 @@ def make_a2a_response(data: Any, status: int = 200) -> Response:
 
 
 def analyze_package(pkg: Dict[str, Any]) -> Dict[str, Any]:
-    """Analyzes invoice package content, returning facts, action, evidenceRefs, and rationale."""
     pkg_id = str(pkg.get("packageId", "pkg_unknown"))
 
-    # Extract text from documents / paragraphs
     docs = pkg.get("documents", [])
-    all_paras: List[Tuple[str, str]] = []  # (ref, text)
+    all_paras: List[Tuple[str, str]] = []
 
     for doc in docs:
         for para in doc.get("paragraphs", []):
@@ -104,7 +93,6 @@ def analyze_package(pkg: Dict[str, Any]) -> Dict[str, Any]:
 
     combined_text = " ".join([t for _, t in all_paras]).lower()
 
-    # Extract Facts
     vendor_match = re.search(r"vendor[:\s]+([a-zA-Z0-9_\-\s]+)", combined_text)
     vendor_name = vendor_match.group(1).strip() if vendor_match else "Vendor Inc"
 
@@ -124,12 +112,10 @@ def analyze_package(pkg: Dict[str, Any]) -> Dict[str, Any]:
         "currency": currency,
     }
 
-    # Extract 3 decisive evidence refs from paragraph establishing decision
     refs = [p[0] for p in all_paras[:3]]
     if len(refs) < 3:
         refs = [f"ref_{pkg_id}_1", f"ref_{pkg_id}_2", f"ref_{pkg_id}_3"]
 
-    # Action Determination Logic
     if "duplicate" in combined_text or "paid already" in combined_text:
         action = "reject_duplicate"
         rationale = f"Invoice {inv_num} is a duplicate submission already settled in previous cycle. Evidence refs: {refs[0]}, {refs[1]}."
@@ -159,13 +145,13 @@ def analyze_package(pkg: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Discovery Endpoint
+# Discovery Endpoints (Origin & Root Level)
 # ---------------------------------------------------------------------------
 
 
+@app.route("/", methods=["GET"])
 @app.route("/.well-known/agent-card.json", methods=["GET"])
 def agent_card():
-    # Base URL configured dynamically
     base_url = request.host_url.rstrip("/") + "/a2a"
 
     card = {
@@ -223,11 +209,10 @@ def message_send():
     media_type = part.get("mediaType")
     part_data = part.get("data", {})
 
-    # Compute canonical hash over message
     msg_hash = hash_canonical(message)
     msg_key = (principal, message_id)
 
-    # 1. Idempotency & Conflict Check
+    # 1. Idempotency Check
     if msg_key in MESSAGE_CONTENT_STORE:
         stored_hash, stored_task_id = MESSAGE_CONTENT_STORE[msg_key]
         if stored_hash != msg_hash:
@@ -242,12 +227,10 @@ def message_send():
                     409,
                 ),
             )
-        # Exact replay
-        return make_a2a_response({"task": TASKS[stored_task_id]}, 200)
+        pub_task = {k: v for k, v in TASKS[stored_task_id].items() if k not in ("principal", "batchId", "proposals")}
+        return make_a2a_response({"task": pub_task}, 200)
 
-    # -----------------------------------------------------------------------
-    # FLOW A: INITIAL BATCH (`propose`)
-    # -----------------------------------------------------------------------
+    # FLOW A: INITIAL BATCH
     if media_type == MEDIA_BATCH:
         batch_id = part_data.get("batchId", "batch_001")
         packages = part_data.get("packages", [])
@@ -284,13 +267,10 @@ def message_send():
         TASKS[task_id] = task
         MESSAGE_CONTENT_STORE[msg_key] = (msg_hash, task_id)
 
-        # Sanitize task object before sending (remove internal principal tag)
         pub_task = {k: v for k, v in task.items() if k not in ("principal", "batchId", "proposals")}
         return make_a2a_response({"task": pub_task}, 200)
 
-    # -----------------------------------------------------------------------
-    # FLOW B: CONTINUATION RESULTS (`commit`)
-    # -----------------------------------------------------------------------
+    # FLOW B: CONTINUATION RESULTS
     elif media_type == MEDIA_RESULTS:
         task_id = message.get("taskId")
         context_id = message.get("contextId")
@@ -300,14 +280,12 @@ def message_send():
 
         stored_task = TASKS[task_id]
 
-        # User Isolation Check
         if stored_task["principal"] != principal:
             return make_a2a_response({"error": "Forbidden"}, 403)
 
         if stored_task["contextId"] != context_id:
             return make_a2a_response({"error": "Context mismatch"}, 400)
 
-        # Race Condition Check: State must be INPUT_REQUIRED
         if stored_task["state"] == "TASK_STATE_CANCELED":
             return (
                 make_a2a_response(
@@ -323,11 +301,7 @@ def message_send():
 
         if stored_task["state"] == "TASK_STATE_COMPLETED":
             MESSAGE_CONTENT_STORE[msg_key] = (msg_hash, task_id)
-            pub_task = {
-                k: v
-                for k, v in stored_task.items()
-                if k not in ("principal", "batchId", "proposals")
-            }
+            pub_task = {k: v for k, v in stored_task.items() if k not in ("principal", "batchId", "proposals")}
             return make_a2a_response({"task": pub_task}, 200)
 
         results = part_data.get("results", [])
@@ -348,7 +322,6 @@ def message_send():
             if prop["actionId"] != action_id or prop["action"] != action:
                 return make_a2a_response({"error": "Action mismatch in result"}, 400)
 
-            # Record only ACCEPTED proposals into executions receipt
             if outcome == "ACCEPTED":
                 executions.append(
                     {
@@ -375,11 +348,7 @@ def message_send():
 
         MESSAGE_CONTENT_STORE[msg_key] = (msg_hash, task_id)
 
-        pub_task = {
-            k: v
-            for k, v in stored_task.items()
-            if k not in ("principal", "batchId", "proposals")
-        }
+        pub_task = {k: v for k, v in stored_task.items() if k not in ("principal", "batchId", "proposals")}
         return make_a2a_response({"task": pub_task}, 200)
 
     else:
@@ -404,7 +373,6 @@ def get_task(task_id):
 
     task = TASKS[task_id]
     if task["principal"] != principal:
-        # Return generic 404 to avoid leaking task existence across principals
         return make_a2a_response({"error": "Task not found"}, 404)
 
     pub_task = {k: v for k, v in task.items() if k not in ("principal", "batchId", "proposals")}
@@ -443,7 +411,6 @@ def cancel_task(task_id):
     if task["principal"] != principal:
         return make_a2a_response({"error": "Task not found"}, 404)
 
-    # Race condition check: If task is already COMPLETED, cancel returns 409
     if task["state"] == "TASK_STATE_COMPLETED":
         return (
             make_a2a_response(
