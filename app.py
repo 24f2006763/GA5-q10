@@ -17,13 +17,8 @@ MEDIA_RECEIPTS = "application/vnd.ga5.invoice-action-receipts+json"
 PROTO_VERSION = "1.0"
 
 # In-Memory Storage
-# TASKS: taskId -> task_dict
 TASKS: Dict[str, Dict[str, Any]] = {}
-
-# MESSAGE_STORE: (principal, messageId) -> (message_hash, taskId)
 MESSAGE_STORE: Dict[Tuple[str, str], Tuple[str, str]] = {}
-
-# PACKAGE_CACHE: package_canonical_hash -> proposal_dict
 PACKAGE_CACHE: Dict[str, Dict[str, Any]] = {}
 
 
@@ -91,7 +86,6 @@ def analyze_package(pkg: Dict[str, Any]) -> Dict[str, Any]:
 
     controlling_refs: List[str] = []
     controlling_action = "settle_invoice"
-    controlling_text = ""
 
     all_text = ""
     vendor_name = "Vendor Corp"
@@ -101,8 +95,12 @@ def analyze_package(pkg: Dict[str, Any]) -> Dict[str, Any]:
 
     for doc in docs:
         doc_title = str(doc.get("title", "")).lower()
-        # Skip cover sheets, archive examples, and training decoys
-        if "cover" in doc_title or "archive" in doc_title or "decoy" in doc_title or "example" in doc_title:
+        if (
+            "cover" in doc_title
+            or "archive" in doc_title
+            or "decoy" in doc_title
+            or "example" in doc_title
+        ):
             continue
 
         for para in doc.get("paragraphs", []):
@@ -110,12 +108,13 @@ def analyze_package(pkg: Dict[str, Any]) -> Dict[str, Any]:
             text = str(para.get("text", ""))
             all_text += " " + text.lower()
 
-            # Extract facts from text
             v_match = re.search(r"vendor[:\s]+([a-zA-Z0-9_\-\s]+)", text, re.IGNORECASE)
             if v_match:
                 vendor_name = v_match.group(1).strip()
 
-            inv_match = re.search(r"invoice[_-]?(?:num|number)?[:\s]+([a-zA-Z0-9_\-]+)", text, re.IGNORECASE)
+            inv_match = re.search(
+                r"invoice[_-]?(?:num|number)?[:\s]+([a-zA-Z0-9_\-]+)", text, re.IGNORECASE
+            )
             if inv_match:
                 inv_num = inv_match.group(1).strip()
 
@@ -127,37 +126,39 @@ def analyze_package(pkg: Dict[str, Any]) -> Dict[str, Any]:
             if curr_match:
                 currency = curr_match.group(1).upper()
 
-            # Extract bracketed evidence refs inside paragraph text [ref_xxx]
             brackets = re.findall(r"\[([a-zA-Z0-9_\-]+)\]", text)
             if not brackets and ref:
                 brackets = [ref]
 
             text_lower = text.lower()
 
-            # Determine controlling action from paragraph (ignoring negations)
-            if "not duplicate" not in text_lower and ("duplicate" in text_lower or "already paid" in text_lower):
+            if "not duplicate" not in text_lower and (
+                "duplicate" in text_lower or "already paid" in text_lower
+            ):
                 controlling_action = "reject_duplicate"
                 controlling_refs = brackets
-                controlling_text = text
-            elif "not hold" not in text_lower and ("hold" in text_lower or "verify delivery" in text_lower or "pause" in text_lower):
+            elif "not hold" not in text_lower and (
+                "hold" in text_lower or "verify delivery" in text_lower or "pause" in text_lower
+            ):
                 if controlling_action != "reject_duplicate":
                     controlling_action = "hold_invoice"
                     controlling_refs = brackets
-                    controlling_text = text
-            elif "no conflict" not in text_lower and ("conflict" in text_lower or "mismatch" in text_lower or "exception" in text_lower):
+            elif "no conflict" not in text_lower and (
+                "conflict" in text_lower or "mismatch" in text_lower or "exception" in text_lower
+            ):
                 if controlling_action not in ("reject_duplicate", "hold_invoice"):
                     controlling_action = "open_exception"
                     controlling_refs = brackets
-                    controlling_text = text
-            elif "within authority" not in text_lower and (amount_minor > 100000 or "approval required" in text_lower or "exceeds authority" in text_lower):
+            elif "within authority" not in text_lower and (
+                amount_minor > 100000
+                or "approval required" in text_lower
+                or "exceeds authority" in text_lower
+            ):
                 if controlling_action not in ("reject_duplicate", "hold_invoice", "open_exception"):
                     controlling_action = "request_approval"
                     controlling_refs = brackets
-                    controlling_text = text
 
-    # Global fallback if no specific rule matched
     if not controlling_refs:
-        # Collect first 3 bracketed refs from all text
         all_brackets = re.findall(r"\[([a-zA-Z0-9_\-]+)\]", all_text)
         controlling_refs = list(dict.fromkeys(all_brackets))[:3]
 
@@ -173,7 +174,6 @@ def analyze_package(pkg: Dict[str, Any]) -> Dict[str, Any]:
         "currency": currency,
     }
 
-    # Construct precise rationale citing action and evidence refs
     rationale = (
         f"Selected action {controlling_action} for invoice {inv_num} (vendor: {vendor_name}, amount: {amount_minor} {currency}). "
         f"Controlling evidence establishes decision via references {controlling_refs[0]}, {controlling_refs[1]}, and {controlling_refs[2]}."
@@ -192,7 +192,8 @@ def analyze_package(pkg: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Discovery Endpoints (Origin & Base URL)
+# PUBLIC Discovery Endpoint (GET /.well-known/agent-card.json)
+# NO AUTH / NO A2A-HEADER REQUIREMENTS HERE
 # ---------------------------------------------------------------------------
 
 
@@ -241,6 +242,7 @@ def agent_card():
 # ---------------------------------------------------------------------------
 
 
+@app.route("/", methods=["POST"])
 @app.route("/a2a/message:send", methods=["POST"])
 @app.route("/message:send", methods=["POST"])
 def message_send():
@@ -262,7 +264,6 @@ def message_send():
     media_type = part.get("mediaType")
     part_data = part.get("data", {})
 
-    # Hash ONLY message object (ignoring configuration) for idempotency check
     msg_hash = hash_canonical(message)
     msg_key = (principal, message_id)
 
@@ -288,9 +289,7 @@ def message_send():
         }
         return make_a2a_response({"task": pub_task}, 200)
 
-    # -----------------------------------------------------------------------
     # STAGE 1: PROPOSE BATCH
-    # -----------------------------------------------------------------------
     if media_type == MEDIA_BATCH:
         batch_id = part_data.get("batchId", "batch_001")
         packages = part_data.get("packages", [])
@@ -330,9 +329,7 @@ def message_send():
         pub_task = {k: v for k, v in task.items() if k not in ("principal", "batchId", "proposals")}
         return make_a2a_response({"task": pub_task}, 200)
 
-    # -----------------------------------------------------------------------
     # STAGE 2: COMMIT RESULTS
-    # -----------------------------------------------------------------------
     elif media_type == MEDIA_RESULTS:
         task_id = message.get("taskId")
         context_id = message.get("contextId")
@@ -348,7 +345,6 @@ def message_send():
         if stored_task["contextId"] != context_id:
             return make_a2a_response({"error": "Context ID mismatch"}, 400)
 
-        # Race Condition Check: Cannot process results on canceled task
         if stored_task["state"] == "TASK_STATE_CANCELED":
             return (
                 make_a2a_response(
@@ -362,7 +358,6 @@ def message_send():
                 ),
             )
 
-        # Replay check
         if stored_task["state"] == "TASK_STATE_COMPLETED":
             MESSAGE_STORE[msg_key] = (msg_hash, task_id)
             pub_task = {
@@ -416,7 +411,7 @@ def message_send():
 
         MESSAGE_STORE[msg_key] = (msg_hash, task_id)
 
-        pub_task = {k: v for k, v in stored_task.items() if k not in ("principal", "batchId", "proposals")}
+        pub_task = {k: v for k, v in task.items() if k not in ("principal", "batchId", "proposals")}
         return make_a2a_response({"task": pub_task}, 200)
 
     else:
@@ -441,7 +436,6 @@ def get_task(task_id):
 
     task = TASKS[task_id]
     if task["principal"] != principal:
-        # Generic 404 to prevent user-enumeration
         return make_a2a_response({"error": "Task not found"}, 404)
 
     pub_task = {k: v for k, v in task.items() if k not in ("principal", "batchId", "proposals")}
@@ -480,7 +474,6 @@ def cancel_task(task_id):
     if task["principal"] != principal:
         return make_a2a_response({"error": "Task not found"}, 404)
 
-    # Race condition: Return 409 if task is already completed
     if task["state"] == "TASK_STATE_COMPLETED":
         return (
             make_a2a_response(
