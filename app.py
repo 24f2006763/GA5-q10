@@ -16,7 +16,7 @@ MEDIA_RECEIPTS = "application/vnd.ga5.invoice-action-receipts+json"
 
 PROTO_VERSION = "1.0"
 
-# In-Memory Stores
+# In-Memory Storage
 TASKS: Dict[str, Dict[str, Any]] = {}
 MESSAGE_STORE: Dict[Tuple[str, str], Tuple[str, str]] = {}
 PACKAGE_CACHE: Dict[str, Dict[str, Any]] = {}
@@ -50,18 +50,27 @@ def get_bearer_principal() -> Optional[str]:
 
 
 def validate_a2a_headers() -> Tuple[bool, Optional[Response], int]:
-    principal = get_bearer_principal()
-    if not principal:
-        return False, jsonify({"error": "Unauthorized: Bearer token required"}), 401
-
+    # 1. Reject missing or non-1.0 A2A-Version header with HTTP 400
     version = request.headers.get("A2A-Version")
     if version != PROTO_VERSION:
-        return False, jsonify({"error": "Invalid A2A-Version header"}), 400
+        resp = jsonify({"error": "Invalid or missing A2A-Version header"})
+        resp.headers["Content-Type"] = MEDIA_A2A_JSON
+        return False, resp, 400
 
+    # 2. Reject missing Bearer authentication token with HTTP 401
+    principal = get_bearer_principal()
+    if not principal:
+        resp = jsonify({"error": "Unauthorized: Bearer token required"})
+        resp.headers["Content-Type"] = MEDIA_A2A_JSON
+        return False, resp, 401
+
+    # 3. Reject invalid Content-Type on POST with HTTP 400
     if request.method == "POST":
         content_type = request.headers.get("Content-Type", "")
         if MEDIA_A2A_JSON not in content_type:
-            return False, jsonify({"error": "Invalid Content-Type"}), 400
+            resp = jsonify({"error": "Invalid Content-Type"})
+            resp.headers["Content-Type"] = MEDIA_A2A_JSON
+            return False, resp, 400
 
     return True, None, 200
 
@@ -75,7 +84,7 @@ def make_a2a_response(data: Any, status: int = 200) -> Response:
 
 
 # ---------------------------------------------------------------------------
-# Document Analysis Engine
+# Deep Document Analysis Engine
 # ---------------------------------------------------------------------------
 
 
@@ -191,15 +200,12 @@ def analyze_package(pkg: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# PUBLIC Discovery Endpoints (Handles /app.py and root paths)
+# PUBLIC Agent Card Endpoint (NO AUTHENTICATION REQUIRED HERE)
 # ---------------------------------------------------------------------------
 
 
-@app.route("/", methods=["GET"])
-@app.route("/app.py", methods=["GET"])
 @app.route("/.well-known/agent-card.json", methods=["GET"])
 @app.route("/a2a/.well-known/agent-card.json", methods=["GET"])
-@app.route("/app.py/.well-known/agent-card.json", methods=["GET"])
 def agent_card():
     host_url = request.host_url.rstrip("/")
     base_url = f"{host_url}/a2a"
@@ -244,7 +250,6 @@ def agent_card():
 
 
 @app.route("/", methods=["POST"])
-@app.route("/app.py", methods=["POST"])
 @app.route("/a2a/message:send", methods=["POST"])
 @app.route("/message:send", methods=["POST"])
 def message_send():
@@ -269,7 +274,7 @@ def message_send():
     msg_hash = hash_canonical(message)
     msg_key = (principal, message_id)
 
-    # 1. Idempotency Check
+    # Idempotency Check
     if msg_key in MESSAGE_STORE:
         stored_hash, stored_task_id = MESSAGE_STORE[msg_key]
         if stored_hash != msg_hash:
@@ -421,32 +426,26 @@ def message_send():
 
 
 # ---------------------------------------------------------------------------
-# Task Management Endpoints
+# Task Management Endpoints (PROTECTED BY AUTHENTICATION)
 # ---------------------------------------------------------------------------
 
 
 @app.route("/a2a/tasks/<task_id>", methods=["GET"])
 @app.route("/tasks/<task_id>", methods=["GET"])
-@app.route("/app.py/tasks/<task_id>", methods=["GET"])
 def get_task(task_id):
+    # 1. Enforce strict Bearer Auth & A2A-Version headers FIRST
     valid, err_resp, status = validate_a2a_headers()
     if not valid:
         return err_resp, status
 
     principal = get_bearer_principal()
-    
+
     if task_id not in TASKS:
-        # Fallback for serverless container state variance
-        pub_task = {
-            "id": task_id,
-            "contextId": f"ctx_{task_id[:8]}",
-            "state": "TASK_STATE_INPUT_REQUIRED",
-            "history": [],
-            "artifacts": [],
-        }
-        return make_a2a_response(pub_task, 200)
+        return make_a2a_response({"error": "Task not found"}, 404)
 
     task = TASKS[task_id]
+    
+    # 2. Enforce Strict User Isolation: Return 404 if principal doesn't match
     if task["principal"] != principal:
         return make_a2a_response({"error": "Task not found"}, 404)
 
@@ -456,17 +455,19 @@ def get_task(task_id):
 
 @app.route("/a2a/tasks", methods=["GET"])
 @app.route("/tasks", methods=["GET"])
-@app.route("/app.py/tasks", methods=["GET"])
 def list_tasks():
+    # Enforce strict Bearer Auth & A2A-Version headers
     valid, err_resp, status = validate_a2a_headers()
     if not valid:
         return err_resp, status
 
     principal = get_bearer_principal()
+    
+    # Return ONLY tasks owned by this authenticated principal
     user_tasks = [
         {k: v for k, v in t.items() if k not in ("principal", "batchId", "proposals")}
         for t in TASKS.values()
-        if t["principal"] == principal
+        if t.get("principal") == principal
     ]
 
     return make_a2a_response({"tasks": user_tasks}, 200)
@@ -474,42 +475,37 @@ def list_tasks():
 
 @app.route("/a2a/tasks/<task_id>:cancel", methods=["POST"])
 @app.route("/tasks/<task_id>:cancel", methods=["POST"])
-@app.route("/app.py/tasks/<task_id>:cancel", methods=["POST"])
 def cancel_task(task_id):
+    # Enforce strict Bearer Auth & A2A-Version headers
     valid, err_resp, status = validate_a2a_headers()
     if not valid:
         return err_resp, status
 
     principal = get_bearer_principal()
-    if task_id in TASKS:
-        task = TASKS[task_id]
-        if task["principal"] != principal:
-            return make_a2a_response({"error": "Task not found"}, 404)
 
-        if task["state"] == "TASK_STATE_COMPLETED":
-            return (
-                make_a2a_response(
-                    {
-                        "error": {
-                            "code": "TASK_STATE_CONFLICT",
-                            "message": "Cannot cancel a completed task",
-                        }
-                    },
-                    409,
-                ),
-            )
+    if task_id not in TASKS:
+        return make_a2a_response({"error": "Task not found"}, 404)
 
-        task["state"] = "TASK_STATE_CANCELED"
-        pub_task = {k: v for k, v in task.items() if k not in ("principal", "batchId", "proposals")}
-        return make_a2a_response(pub_task, 200)
+    task = TASKS[task_id]
+    
+    if task["principal"] != principal:
+        return make_a2a_response({"error": "Task not found"}, 404)
 
-    pub_task = {
-        "id": task_id,
-        "contextId": f"ctx_{task_id[:8]}",
-        "state": "TASK_STATE_CANCELED",
-        "history": [],
-        "artifacts": [],
-    }
+    if task["state"] == "TASK_STATE_COMPLETED":
+        return (
+            make_a2a_response(
+                {
+                    "error": {
+                        "code": "TASK_STATE_CONFLICT",
+                        "message": "Cannot cancel a completed task",
+                    }
+                },
+                409,
+            ),
+        )
+
+    task["state"] = "TASK_STATE_CANCELED"
+    pub_task = {k: v for k, v in task.items() if k not in ("principal", "batchId", "proposals")}
     return make_a2a_response(pub_task, 200)
 
 
